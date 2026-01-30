@@ -1,0 +1,359 @@
+---
+- name: Investigate and (optionally) remediate BGP peers down on MRD switch 10.120.4.34#2
+  hosts: mrd_switch
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    # --- Target / identity ---
+    device_ip: "10.120.4.34"
+    # Optional device OS selector (affects which modules/commands to use)
+    # Supported in this playbook: "ios" (Cisco IOS/IOS-XE), "nxos" (Cisco NX-OS)
+    network_os: "ios"
+
+    # --- Investigation scope ---
+    bgp_vrf: ""          # e.g., "default" or "VRF-NAME" (leave empty for global/default)
+    bgp_af: ""           # e.g., "ipv4 unicast" or "l2vpn evpn" (used for nxos show variants; optional)
+    focus_neighbors: []  # e.g., ["10.0.0.1", "10.0.0.2"]; empty = inspect all
+
+    # --- Remediation controls (safe-by-default) ---
+    remediate: false
+    # If true, will attempt to "no shut" interfaces found administratively down.
+    remediate_no_shut_admin_down: false
+    # If true, will attempt a soft clear of BGP for neighbors in focus (or all) that are not Established.
+    remediate_clear_bgp_soft: false
+
+    # --- Evidence collection ---
+    collect_to_local_dir: "./artifacts/bgp_mrd_10.120.4.34"
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+
+    # --- Timeouts / retries ---
+    command_timeout: 60
+    pause_after_clear_seconds: 5
+
+  pre_tasks:
+    - name: Ensure local artifact directory exists (controller)
+      ansible.builtin.file:
+        path: "{{ collect_to_local_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      run_once: true
+      tags: [always, evidence]
+
+    - name: Assert required connection vars are set
+      ansible.builtin.assert:
+        that:
+          - ansible_network_os is defined or network_os is defined
+        fail_msg: "Set ansible_network_os in inventory or set network_os var (ios/nxos)."
+      tags: [always]
+
+    - name: Normalize ansible_network_os from network_os if not set
+      ansible.builtin.set_fact:
+        ansible_network_os: "{{ 'cisco.ios.ios' if network_os == 'ios' else 'cisco.nxos.nxos' }}"
+      when: ansible_network_os is not defined
+      tags: [always]
+
+  tasks:
+    - name: Capture device identity and clock (baseline)
+      cisco.ios.ios_command:
+        commands:
+          - "show version | include (Cisco IOS|Cisco IOS XE|uptime)"
+          - "show clock"
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.ios.ios'
+      register: ios_identity
+      tags: [investigate, evidence]
+
+    - name: Capture device identity and clock (baseline) - NX-OS
+      cisco.nxos.nxos_command:
+        commands:
+          - "show version | include (NXOS|uptime)"
+          - "show clock"
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.nxos.nxos'
+      register: nxos_identity
+      tags: [investigate, evidence]
+
+    # --- Core BGP state collection ---
+    - name: Collect BGP summary (IOS)
+      cisco.ios.ios_command:
+        commands:
+          - >-
+            show ip bgp summary{% if bgp_vrf|length > 0 %} vrf {{ bgp_vrf }}{% endif %}
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.ios.ios'
+      register: bgp_summary
+      tags: [investigate, bgp, evidence]
+
+    - name: Collect BGP summary (NX-OS)
+      cisco.nxos.nxos_command:
+        commands:
+          - >-
+            show bgp{% if bgp_vrf|length > 0 %} vrf {{ bgp_vrf }}{% endif %} summary
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.nxos.nxos'
+      register: bgp_summary
+      tags: [investigate, bgp, evidence]
+
+    - name: Collect BGP neighbor details (IOS)
+      cisco.ios.ios_command:
+        commands:
+          - >-
+            show ip bgp neighbors{% if bgp_vrf|length > 0 %} vrf {{ bgp_vrf }}{% endif %}
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.ios.ios'
+      register: bgp_neighbors
+      tags: [investigate, bgp, evidence]
+
+    - name: Collect BGP neighbor details (NX-OS)
+      cisco.nxos.nxos_command:
+        commands:
+          - >-
+            show bgp{% if bgp_vrf|length > 0 %} vrf {{ bgp_vrf }}{% endif %} neighbors
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.nxos.nxos'
+      register: bgp_neighbors
+      tags: [investigate, bgp, evidence]
+
+    # --- Additional context: interfaces + reachability indicators ---
+    - name: Collect interface status (IOS)
+      cisco.ios.ios_command:
+        commands:
+          - "show ip interface brief"
+          - "show interfaces description"
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.ios.ios'
+      register: int_status
+      tags: [investigate, interfaces, evidence]
+
+    - name: Collect interface status (NX-OS)
+      cisco.nxos.nxos_command:
+        commands:
+          - "show interface brief"
+          - "show interface description"
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.nxos.nxos'
+      register: int_status
+      tags: [investigate, interfaces, evidence]
+
+    - name: Collect logs related to BGP (IOS)
+      cisco.ios.ios_command:
+        commands:
+          - "show logging | include BGP|%BGP|bgp"
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.ios.ios'
+      register: bgp_logs
+      failed_when: false  # some devices restrict show logging; do not fail investigation
+      tags: [investigate, logs, evidence]
+
+    - name: Collect logs related to BGP (NX-OS)
+      cisco.nxos.nxos_command:
+        commands:
+          - "show logging last 200 | include BGP|%BGP|bgp"
+        timeout: "{{ command_timeout }}"
+      when: ansible_network_os == 'cisco.nxos.nxos'
+      register: bgp_logs
+      failed_when: false
+      tags: [investigate, logs, evidence]
+
+    # --- Save evidence locally ---
+    - name: Write collected outputs to local artifacts (controller)
+      ansible.builtin.copy:
+        dest: "{{ collect_to_local_dir }}/{{ inventory_hostname }}_{{ timestamp }}_evidence.txt"
+        mode: "0640"
+        content: |
+          === DEVICE: {{ inventory_hostname }} ({{ device_ip }}) ===
+          === TIME: {{ timestamp }} ===
+
+          --- IDENTITY ---
+          {% if ios_identity is defined %}
+          {{ ios_identity.stdout | join('\n\n') }}
+          {% elif nxos_identity is defined %}
+          {{ nxos_identity.stdout | join('\n\n') }}
+          {% else %}
+          (identity not collected)
+          {% endif %}
+
+          --- BGP SUMMARY ---
+          {% if bgp_summary is defined %}
+          {{ bgp_summary.stdout | join('\n\n') }}
+          {% endif %}
+
+          --- BGP NEIGHBORS ---
+          {% if bgp_neighbors is defined %}
+          {{ bgp_neighbors.stdout | join('\n\n') }}
+          {% endif %}
+
+          --- INTERFACES ---
+          {% if int_status is defined %}
+          {{ int_status.stdout | join('\n\n') }}
+          {% endif %}
+
+          --- LOGS (BGP FILTER) ---
+          {% if bgp_logs is defined %}
+          {{ bgp_logs.stdout | join('\n\n') }}
+          {% endif %}
+      delegate_to: localhost
+      tags: [evidence]
+
+    # --- Lightweight analysis to decide if remediation is warranted ---
+    # Note: Parsing BGP state reliably differs per vendor/format; we use conservative text checks.
+    - name: Detect indication of peers not Established (best-effort)
+      ansible.builtin.set_fact:
+        peers_problem_indicated: >-
+          {{
+            (bgp_summary.stdout[0] is defined and
+             (bgp_summary.stdout[0] is search('Idle|Active|Connect|OpenSent|OpenConfirm|Down', ignorecase=True)))
+            or
+            (bgp_neighbors.stdout[0] is defined and
+             (bgp_neighbors.stdout[0] is search('BGP state = (Idle|Active|Connect|OpenSent|OpenConfirm)', ignorecase=True)))
+          }}
+      when: bgp_summary is defined and bgp_neighbors is defined
+      tags: [investigate, bgp]
+
+    - name: Report investigation result (no changes)
+      ansible.builtin.debug:
+        msg:
+          - "BGP peer issue indicated: {{ peers_problem_indicated | default('unknown') }}"
+          - "Remediation enabled: remediate={{ remediate }}, no_shut={{ remediate_no_shut_admin_down }}, clear_soft={{ remediate_clear_bgp_soft }}"
+          - "Artifacts saved under: {{ collect_to_local_dir }}"
+      tags: [investigate]
+
+    # --- Optional remediation steps ---
+    # 1) If any interfaces are administratively down (common cause), optionally "no shut".
+    # Because interface name extraction is vendor/format specific, we do NOT auto-derive interface list here.
+    # Provide candidate interfaces explicitly via extra-vars if you want to no-shut.
+    - name: Set candidate interfaces to no-shut (default empty)
+      ansible.builtin.set_fact:
+        candidate_no_shut_interfaces: "{{ candidate_no_shut_interfaces | default([]) }}"
+      tags: [remediate, interfaces]
+
+    - name: Remediate - no shut candidate interfaces (IOS)
+      cisco.ios.ios_config:
+        lines:
+          - "no shutdown"
+        parents: "interface {{ item }}"
+        save_when: modified
+      loop: "{{ candidate_no_shut_interfaces }}"
+      when:
+        - ansible_network_os == 'cisco.ios.ios'
+        - remediate | bool
+        - remediate_no_shut_admin_down | bool
+        - candidate_no_shut_interfaces | length > 0
+      notify: recheck_bgp
+      tags: [remediate, interfaces]
+
+    - name: Remediate - no shut candidate interfaces (NX-OS)
+      cisco.nxos.nxos_config:
+        lines:
+          - "no shutdown"
+        parents: "interface {{ item }}"
+        save_when: modified
+      loop: "{{ candidate_no_shut_interfaces }}"
+      when:
+        - ansible_network_os == 'cisco.nxos.nxos'
+        - remediate | bool
+        - remediate_no_shut_admin_down | bool
+        - candidate_no_shut_interfaces | length > 0
+      notify: recheck_bgp
+      tags: [remediate, interfaces]
+
+    # 2) Soft clear BGP to kick sessions (safe-ish, but still disruptive in some environments).
+    # This playbook requires you to either specify focus_neighbors, or it will attempt a global soft clear.
+    - name: Remediate - clear BGP soft for focus neighbors (IOS)
+      cisco.ios.ios_command:
+        commands: >-
+          {{
+            focus_neighbors | length > 0
+            | ternary(
+                focus_neighbors | map('regex_replace', '^(.*)$',
+                'clear ip bgp ' ~ ('vrf ' ~ bgp_vrf ~ ' ' if bgp_vrf|length>0 else '') ~ '\\1 soft') | list,
+                ['clear ip bgp ' ~ ('vrf ' ~ bgp_vrf ~ ' ' if bgp_vrf|length>0 else '') ~ '* soft']
+              )
+          }}
+        timeout: "{{ command_timeout }}"
+      when:
+        - ansible_network_os == 'cisco.ios.ios'
+        - remediate | bool
+        - remediate_clear_bgp_soft | bool
+        - peers_problem_indicated | default(true) | bool
+      changed_when: true
+      notify: recheck_bgp
+      tags: [remediate, bgp]
+
+    - name: Remediate - clear BGP soft for focus neighbors (NX-OS)
+      cisco.nxos.nxos_command:
+        commands: >-
+          {{
+            focus_neighbors | length > 0
+            | ternary(
+                focus_neighbors | map('regex_replace', '^(.*)$',
+                'clear bgp ' ~ ( 'vrf ' ~ bgp_vrf ~ ' ' if bgp_vrf|length>0 else '' ) ~ '\\1 soft') | list,
+                ['clear bgp ' ~ ( 'vrf ' ~ bgp_vrf ~ ' ' if bgp_vrf|length>0 else '' ) ~ '* soft']
+              )
+          }}
+        timeout: "{{ command_timeout }}"
+      when:
+        - ansible_network_os == 'cisco.nxos.nxos'
+        - remediate | bool
+        - remediate_clear_bgp_soft | bool
+        - peers_problem_indicated | default(true) | bool
+      changed_when: true
+      notify: recheck_bgp
+      tags: [remediate, bgp]
+
+  handlers:
+    - name: recheck_bgp
+      # Handler uses commands (not service restarts) because we're on network gear.
+      listen: recheck_bgp
+      block:
+        - name: Pause briefly after remediation to allow sessions to negotiate
+          ansible.builtin.pause:
+            seconds: "{{ pause_after_clear_seconds }}"
+          tags: [bgp]
+
+        - name: Re-collect BGP summary (IOS)
+          cisco.ios.ios_command:
+            commands:
+              - >-
+                show ip bgp summary{% if bgp_vrf|length > 0 %} vrf {{ bgp_vrf }}{% endif %}
+            timeout: "{{ command_timeout }}"
+          when: ansible_network_os == 'cisco.ios.ios'
+          register: bgp_summary_after
+          tags: [bgp, evidence]
+
+        - name: Re-collect BGP summary (NX-OS)
+          cisco.nxos.nxos_command:
+            commands:
+              - >-
+                show bgp{% if bgp_vrf|length > 0 %} vrf {{ bgp_vrf }}{% endif %} summary
+            timeout: "{{ command_timeout }}"
+          when: ansible_network_os == 'cisco.nxos.nxos'
+          register: bgp_summary_after
+          tags: [bgp, evidence]
+
+        - name: Save after-state BGP summary to local artifacts (controller)
+          ansible.builtin.copy:
+            dest: "{{ collect_to_local_dir }}/{{ inventory_hostname }}_{{ timestamp }}_bgp_summary_after.txt"
+            mode: "0640"
+            content: |
+              === AFTER BGP SUMMARY ===
+              {{ (bgp_summary_after.stdout | default([])) | join('\n\n') }}
+          delegate_to: localhost
+          tags: [evidence]
+
+        - name: Display after-state BGP summary
+          ansible.builtin.debug:
+            msg: "{{ (bgp_summary_after.stdout | default([])) | join('\n\n') }}"
+          tags: [bgp]
+      rescue:
+        - name: Handler failed - record error (controller)
+          ansible.builtin.copy:
+            dest: "{{ collect_to_local_dir }}/{{ inventory_hostname }}_{{ timestamp }}_handler_error.txt"
+            mode: "0640"
+            content: |
+              Handler recheck_bgp failed on {{ inventory_hostname }} at {{ timestamp }}.
+              Please review connectivity/privileges and the play output.
+          delegate_to: localhost
+          tags: [evidence]
