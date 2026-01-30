@@ -1,0 +1,215 @@
+---
+- name: Remediate MRD switch BGP peers down via Rundeck and verify recovery
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # Rundeck API settings
+    rundeck_url: "https://rundeck.cassaniti.id.au"
+    rundeck_api_version: "50"
+    rundeck_timeout_seconds: 30
+    rundeck_validate_certs: true
+
+    # Auth: set via env var to avoid secrets in code:
+    # export RUNDECK_API_TOKEN="..."
+    rundeck_api_token: "{{ lookup('ansible.builtin.env', 'RUNDECK_API_TOKEN') | default('', true) }}"
+
+    # Required Rundeck job options
+    device_ip: "10.120.4.34"
+    cust_code: "demo"
+
+    # Rundeck job IDs (from incident context)
+    rundeck_bgp_restart_job_id: "b35b5229-d91e-4749-9716-4ad13a6008c0"
+    rundeck_bgp_verify_job_id: "000ab436-801c-444d-b265-e41b1c3722c2"
+
+    # Execution polling
+    poll_retries: 60          # 60 * 10s = 10 minutes max wait by default
+    poll_delay_seconds: 10
+    # Treat these as successful end-states; anything else terminal is failure
+    rundeck_success_states: ["succeeded"]
+
+  pre_tasks:
+    - name: Validate required inputs are present
+      ansible.builtin.assert:
+        that:
+          - rundeck_api_token | length > 0
+          - device_ip | length > 0
+          - cust_code | length > 0
+        fail_msg: >-
+          Missing required input. Ensure RUNDECK_API_TOKEN is set and device_ip/cust_code are provided.
+          Example: export RUNDECK_API_TOKEN="...".
+      tags: [always]
+
+    - name: Show target and customer context (non-sensitive)
+      ansible.builtin.debug:
+        msg:
+          - "Target device_ip: {{ device_ip }}"
+          - "Customer code: {{ cust_code }}"
+          - "Rundeck URL: {{ rundeck_url }}"
+      tags: [always]
+
+  tasks:
+    - name: Trigger Rundeck job - BGP Peer Restart (remediation)
+      ansible.builtin.uri:
+        url: "{{ rundeck_url }}/api/{{ rundeck_api_version }}/job/{{ rundeck_bgp_restart_job_id }}/run"
+        method: POST
+        headers:
+          Accept: "application/json"
+          X-Rundeck-Auth-Token: "{{ rundeck_api_token }}"
+        body_format: json
+        body:
+          options:
+            device_ip: "{{ device_ip }}"
+            cust_code: "{{ cust_code }}"
+        return_content: true
+        status_code: [200, 201]
+        timeout: "{{ rundeck_timeout_seconds }}"
+        validate_certs: "{{ rundeck_validate_certs }}"
+      register: bgp_restart_launch
+      changed_when: true
+      tags: [rundeck, remediation, bgp_restart]
+
+    - name: Extract remediation execution ID
+      ansible.builtin.set_fact:
+        bgp_restart_execution_id: >-
+          {{
+            (bgp_restart_launch.json.id
+             | default(bgp_restart_launch.json.execution.id, true))
+          }}
+      tags: [rundeck, remediation, bgp_restart]
+
+    - name: Fail if remediation execution ID could not be determined
+      ansible.builtin.fail:
+        msg: "Could not determine remediation execution ID from Rundeck response: {{ bgp_restart_launch.content | default(bgp_restart_launch.json, true) }}"
+      when: bgp_restart_execution_id is not defined or (bgp_restart_execution_id | string | length) == 0
+      tags: [rundeck, remediation, bgp_restart]
+
+    - name: Wait for remediation execution to complete
+      ansible.builtin.uri:
+        url: "{{ rundeck_url }}/api/{{ rundeck_api_version }}/execution/{{ bgp_restart_execution_id }}"
+        method: GET
+        headers:
+          Accept: "application/json"
+          X-Rundeck-Auth-Token: "{{ rundeck_api_token }}"
+        return_content: true
+        status_code: [200]
+        timeout: "{{ rundeck_timeout_seconds }}"
+        validate_certs: "{{ rundeck_validate_certs }}"
+      register: bgp_restart_status
+      until: bgp_restart_status.json.status in ['succeeded', 'failed', 'aborted', 'timedout']
+      retries: "{{ poll_retries }}"
+      delay: "{{ poll_delay_seconds }}"
+      tags: [rundeck, remediation, bgp_restart]
+
+    - name: Assert remediation execution succeeded
+      ansible.builtin.assert:
+        that:
+          - bgp_restart_status.json.status in rundeck_success_states
+        fail_msg: >-
+          Remediation job finished in state '{{ bgp_restart_status.json.status }}'.
+          Execution URL: {{ rundeck_url }}/project/{{ bgp_restart_status.json.project | default('Default') }}/execution/show/{{ bgp_restart_execution_id }}
+      tags: [rundeck, remediation, bgp_restart]
+
+    # Post-check / verification job
+    - name: Trigger Rundeck job - BGP verification / session health check
+      ansible.builtin.uri:
+        url: "{{ rundeck_url }}/api/{{ rundeck_api_version }}/job/{{ rundeck_bgp_verify_job_id }}/run"
+        method: POST
+        headers:
+          Accept: "application/json"
+          X-Rundeck-Auth-Token: "{{ rundeck_api_token }}"
+        body_format: json
+        body:
+          options:
+            device_ip: "{{ device_ip }}"
+            cust_code: "{{ cust_code }}"
+        return_content: true
+        status_code: [200, 201]
+        timeout: "{{ rundeck_timeout_seconds }}"
+        validate_certs: "{{ rundeck_validate_certs }}"
+      register: bgp_verify_launch
+      changed_when: true
+      tags: [rundeck, verify, bgp_verify]
+
+    - name: Extract verification execution ID
+      ansible.builtin.set_fact:
+        bgp_verify_execution_id: >-
+          {{
+            (bgp_verify_launch.json.id
+             | default(bgp_verify_launch.json.execution.id, true))
+          }}
+      tags: [rundeck, verify, bgp_verify]
+
+    - name: Fail if verification execution ID could not be determined
+      ansible.builtin.fail:
+        msg: "Could not determine verification execution ID from Rundeck response: {{ bgp_verify_launch.content | default(bgp_verify_launch.json, true) }}"
+      when: bgp_verify_execution_id is not defined or (bgp_verify_execution_id | string | length) == 0
+      tags: [rundeck, verify, bgp_verify]
+
+    - name: Wait for verification execution to complete
+      ansible.builtin.uri:
+        url: "{{ rundeck_url }}/api/{{ rundeck_api_version }}/execution/{{ bgp_verify_execution_id }}"
+        method: GET
+        headers:
+          Accept: "application/json"
+          X-Rundeck-Auth-Token: "{{ rundeck_api_token }}"
+        return_content: true
+        status_code: [200]
+        timeout: "{{ rundeck_timeout_seconds }}"
+        validate_certs: "{{ rundeck_validate_certs }}"
+      register: bgp_verify_status
+      until: bgp_verify_status.json.status in ['succeeded', 'failed', 'aborted', 'timedout']
+      retries: "{{ poll_retries }}"
+      delay: "{{ poll_delay_seconds }}"
+      tags: [rundeck, verify, bgp_verify]
+
+    - name: Assert verification execution succeeded
+      ansible.builtin.assert:
+        that:
+          - bgp_verify_status.json.status in rundeck_success_states
+        fail_msg: >-
+          Verification job finished in state '{{ bgp_verify_status.json.status }}'.
+          Execution URL: {{ rundeck_url }}/project/{{ bgp_verify_status.json.project | default('Default') }}/execution/show/{{ bgp_verify_execution_id }}
+      tags: [rundeck, verify, bgp_verify]
+
+    # Optional: fetch execution output for evidence (useful for incident work notes)
+    - name: Fetch remediation execution output (last 4k lines capped by API defaults)
+      ansible.builtin.uri:
+        url: "{{ rundeck_url }}/api/{{ rundeck_api_version }}/execution/{{ bgp_restart_execution_id }}/output?format=json"
+        method: GET
+        headers:
+          Accept: "application/json"
+          X-Rundeck-Auth-Token: "{{ rundeck_api_token }}"
+        return_content: true
+        status_code: [200]
+        timeout: "{{ rundeck_timeout_seconds }}"
+        validate_certs: "{{ rundeck_validate_certs }}"
+      register: bgp_restart_output
+      failed_when: false  # do not fail play if output endpoint is restricted
+      tags: [rundeck, evidence, bgp_restart]
+
+    - name: Fetch verification execution output (last 4k lines capped by API defaults)
+      ansible.builtin.uri:
+        url: "{{ rundeck_url }}/api/{{ rundeck_api_version }}/execution/{{ bgp_verify_execution_id }}/output?format=json"
+        method: GET
+        headers:
+          Accept: "application/json"
+          X-Rundeck-Auth-Token: "{{ rundeck_api_token }}"
+        return_content: true
+        status_code: [200]
+        timeout: "{{ rundeck_timeout_seconds }}"
+        validate_certs: "{{ rundeck_validate_certs }}"
+      register: bgp_verify_output
+      failed_when: false
+      tags: [rundeck, evidence, bgp_verify]
+
+    - name: Summary - executions and URLs
+      ansible.builtin.debug:
+        msg:
+          - "Remediation execution: {{ bgp_restart_execution_id }} ({{ rundeck_url }}/api/{{ rundeck_api_version }}/execution/{{ bgp_restart_execution_id }})"
+          - "Verification execution: {{ bgp_verify_execution_id }} ({{ rundeck_url }}/api/{{ rundeck_api_version }}/execution/{{ bgp_verify_execution_id }})"
+          - "Remediation state: {{ bgp_restart_status.json.status }}"
+          - "Verification state: {{ bgp_verify_status.json.status }}"
+      tags: [always]
+
+  # No handlers required since this playbook triggers Rundeck automation rather than managing local services.
