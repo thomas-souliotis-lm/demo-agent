@@ -1,0 +1,277 @@
+---
+- name: "MRD 10.120.4.34 - Triage and remediate BGP peers down; update ServiceNow incident"
+  hosts: mrd_switches
+  gather_facts: false
+
+  vars:
+    # ---- Target / ticket context ----
+    target_device_ip: "10.120.4.34"
+    incident_number: "INC0011700"
+    incident_state_in_progress: "In Progress"
+    incident_state_resolved: "Resolved"
+    assignment_group: "Network Operations"
+    customer_code: "MRD"
+
+    # ---- Network OS / connection defaults ----
+    # Set to the correct network_os for your platform:
+    # eos, ios, iosxr, nxos, junos
+    ansible_network_os: "eos"
+    ansible_connection: ansible.netcommon.network_cli
+    ansible_command_timeout: 60
+
+    # ---- Data capture ----
+    artifact_dir: "./artifacts/{{ inventory_hostname }}_{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}"
+    # Commands are intentionally generic; adjust per OS where needed.
+    bgp_summary_cmd: "show bgp summary"
+    bgp_neighbors_cmd: "show bgp neighbors"
+    interface_status_cmd: "show interfaces status"
+    interface_counters_cmd: "show interfaces counters errors"
+    log_cmd: "show logging last 200"
+
+    # ---- Remediation behavior ----
+    # If true, attempt a safe reset of *only* neighbors detected as non-Established
+    remediation_enabled: false
+    # Some platforms support "clear bgp neighbor <ip> soft in|out" or "clear ip bgp <ip>"
+    # Provide a template appropriate for your OS below.
+    clear_bgp_neighbor_cmd_template: "clear bgp neighbor {{ neighbor_ip }}"
+
+    # ---- Success criteria / parsing ----
+    established_token: "Established"
+    not_established_tokens:
+      - "Idle"
+      - "Active"
+      - "Connect"
+      - "OpenSent"
+      - "OpenConfirm"
+      - "Idle (Admin)"
+      - "Down"
+
+    # ---- ServiceNow integration ----
+    # Uses servicenow.itsm collection.
+    # Provide SN instance URL and credentials via vars, vault, or env vars.
+    snow_instance: "{{ lookup('env', 'SN_INSTANCE') | default('', true) }}"
+    snow_username: "{{ lookup('env', 'SN_USERNAME') | default('', true) }}"
+    snow_password: "{{ lookup('env', 'SN_PASSWORD') | default('', true) }}"
+    # If false, skip ServiceNow updates (useful for local testing)
+    snow_update_enabled: true
+
+  pre_tasks:
+    - name: "Assert this play is targeting the intended device"
+      ansible.builtin.assert:
+        that:
+          - target_device_ip in (hostvars[inventory_hostname].get('ansible_host', inventory_hostname) | string)
+        fail_msg: >-
+          This host ({{ inventory_hostname }}) does not appear to match target_device_ip={{ target_device_ip }}.
+          Set inventory ansible_host correctly or change target_device_ip.
+      tags: [always, safety]
+
+    - name: "Create artifact directory"
+      ansible.builtin.file:
+        path: "{{ artifact_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      run_once: false
+      tags: [always, artifacts]
+
+    - name: "Validate ServiceNow config when updates enabled"
+      ansible.builtin.assert:
+        that:
+          - (not snow_update_enabled) or (snow_instance | length > 0 and snow_username | length > 0 and snow_password | length > 0)
+        fail_msg: >-
+          ServiceNow updates are enabled but SN_INSTANCE/SN_USERNAME/SN_PASSWORD are not set.
+          Export env vars or set snow_* vars, or set snow_update_enabled=false.
+      tags: [always, snow]
+
+  tasks:
+    - name: "Collect BGP summary"
+      ansible.netcommon.cli_command:
+        command: "{{ bgp_summary_cmd }}"
+      register: bgp_summary
+      tags: [triage, bgp]
+
+    - name: "Collect BGP neighbor details"
+      ansible.netcommon.cli_command:
+        command: "{{ bgp_neighbors_cmd }}"
+      register: bgp_neighbors
+      tags: [triage, bgp]
+
+    - name: "Collect interface status"
+      ansible.netcommon.cli_command:
+        command: "{{ interface_status_cmd }}"
+      register: int_status
+      tags: [triage, interfaces]
+
+    - name: "Collect interface error counters"
+      ansible.netcommon.cli_command:
+        command: "{{ interface_counters_cmd }}"
+      register: int_counters
+      tags: [triage, interfaces]
+
+    - name: "Collect recent logs (last 200 lines)"
+      ansible.netcommon.cli_command:
+        command: "{{ log_cmd }}"
+      register: logs
+      failed_when: false  # some platforms/roles may restrict log access
+      tags: [triage, logs]
+
+    # ---- Persist artifacts locally for attachment to incident / auditing ----
+    - name: "Write triage outputs to artifact files"
+      ansible.builtin.copy:
+        dest: "{{ artifact_dir }}/{{ item.name }}.txt"
+        content: |
+          ### {{ item.name }}
+          ### Host: {{ inventory_hostname }}
+          ### Timestamp: {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+
+          {{ item.content }}
+        mode: "0640"
+      loop:
+        - { name: "bgp_summary",    content: "{{ bgp_summary.stdout | default('') }}" }
+        - { name: "bgp_neighbors",  content: "{{ bgp_neighbors.stdout | default('') }}" }
+        - { name: "int_status",     content: "{{ int_status.stdout | default('') }}" }
+        - { name: "int_counters",   content: "{{ int_counters.stdout | default('') }}" }
+        - { name: "logs",           content: "{{ logs.stdout | default('') }}" }
+      delegate_to: localhost
+      tags: [artifacts, triage]
+
+    # ---- Determine if there are any non-Established peers (best-effort parsing) ----
+    # NOTE: Output format varies across NOS. This is a conservative heuristic:
+    # - If summary contains the word "Established", we don't assume all are up.
+    # - We look for common non-established state tokens; if any exist, mark as degraded.
+    - name: "Detect presence of non-Established BGP states in summary (heuristic)"
+      ansible.builtin.set_fact:
+        bgp_degraded: "{{ (not_established_tokens | select('search', bgp_summary.stdout | default('')) | list | length) > 0 }}"
+      tags: [triage, bgp]
+
+    - name: "Set human-readable triage conclusion"
+      ansible.builtin.set_fact:
+        triage_conclusion: >-
+          Device={{ inventory_hostname }} (target={{ target_device_ip }}):
+          BGP degraded={{ bgp_degraded }}.
+          See attached artifacts for: bgp_summary, bgp_neighbors, interface status/counters, logs.
+      tags: [triage]
+
+    # ---- Optional remediation: attempt a safe reset for down neighbors ----
+    # Because neighbor IP extraction is NOS-specific, remediation supports two modes:
+    # 1) Operator provides neighbor list via extra-vars: -e "bgp_neighbors_to_reset=['1.1.1.1','2.2.2.2']"
+    # 2) Otherwise, remediation is skipped and only triage evidence is collected.
+    - name: "Initialize neighbor reset list if not provided"
+      ansible.builtin.set_fact:
+        bgp_neighbors_to_reset: "{{ bgp_neighbors_to_reset | default([]) }}"
+      tags: [remediation, bgp]
+
+    - name: "Remediation gate - ensure we only run when explicitly enabled"
+      ansible.builtin.debug:
+        msg: >-
+          remediation_enabled={{ remediation_enabled }}; neighbors_to_reset={{ bgp_neighbors_to_reset }}.
+          No automatic parsing of neighbor IPs is performed (NOS-specific). Provide bgp_neighbors_to_reset to proceed.
+      tags: [remediation, bgp]
+
+    - name: "Clear BGP neighbors (controlled) - only when enabled and list provided"
+      ansible.netcommon.cli_command:
+        command: "{{ clear_bgp_neighbor_cmd_template }}"
+      loop: "{{ bgp_neighbors_to_reset }}"
+      loop_control:
+        loop_var: neighbor_ip
+      when:
+        - remediation_enabled | bool
+        - bgp_neighbors_to_reset | length > 0
+      notify: "Wait for BGP to reconverge then re-collect summary"
+      tags: [remediation, bgp]
+
+    # ---- Update ServiceNow with work notes and attach artifact path ----
+    - name: "Update ServiceNow incident with triage results (work notes)"
+      servicenow.itsm.incident:
+        instance: "{{ snow_instance }}"
+        username: "{{ snow_username }}"
+        password: "{{ snow_password }}"
+        number: "{{ incident_number }}"
+        state: "{{ incident_state_in_progress }}"
+        assignment_group: "{{ assignment_group }}"
+        work_notes: |
+          Automation triage executed for alert: BGP peers down
+          Customer/CI: {{ customer_code }} switch {{ target_device_ip }}
+          Host: {{ inventory_hostname }}
+
+          Summary:
+          - bgp_degraded={{ bgp_degraded }}
+          - remediation_enabled={{ remediation_enabled }}
+          - neighbors_to_reset={{ bgp_neighbors_to_reset | default([]) }}
+
+          Evidence captured (local artifacts on controller):
+          - {{ artifact_dir }}/bgp_summary.txt
+          - {{ artifact_dir }}/bgp_neighbors.txt
+          - {{ artifact_dir }}/int_status.txt
+          - {{ artifact_dir }}/int_counters.txt
+          - {{ artifact_dir }}/logs.txt
+
+          Please review neighbor details for last reset reason, impacted VRFs, impacted prefixes, and verify redundant path/device.
+          If rollback/maintenance is required, confirm so a CHG can be raised.
+      when: snow_update_enabled | bool
+      delegate_to: localhost
+      tags: [snow, triage]
+
+    # ---- If not degraded, optionally mark resolved (operator controlled) ----
+    - name: "Optionally resolve incident when BGP not degraded (set resolve_incident=true to enable)"
+      vars:
+        resolve_incident: "{{ resolve_incident | default(false) }}"
+      servicenow.itsm.incident:
+        instance: "{{ snow_instance }}"
+        username: "{{ snow_username }}"
+        password: "{{ snow_password }}"
+        number: "{{ incident_number }}"
+        state: "{{ incident_state_resolved }}"
+        close_code: "Solved (Work Around)"
+        close_notes: |
+          Verified BGP appears healthy based on automation triage.
+          No non-Established tokens detected in summary heuristic; refer to artifacts for full evidence:
+          {{ artifact_dir }}/bgp_summary.txt
+      when:
+        - snow_update_enabled | bool
+        - (resolve_incident | bool)
+        - (not bgp_degraded | bool)
+      delegate_to: localhost
+      tags: [snow, closeout]
+
+  handlers:
+    - name: "Wait for BGP to reconverge then re-collect summary"
+      # BGP convergence times vary; keep conservative and re-check once.
+      ansible.builtin.pause:
+        seconds: 30
+      listen: "Wait for BGP to reconverge then re-collect summary"
+
+    - name: "Re-collect BGP summary after remediation"
+      ansible.netcommon.cli_command:
+        command: "{{ bgp_summary_cmd }}"
+      register: bgp_summary_post
+      listen: "Wait for BGP to reconverge then re-collect summary"
+
+    - name: "Write post-remediation BGP summary artifact"
+      ansible.builtin.copy:
+        dest: "{{ artifact_dir }}/bgp_summary_post.txt"
+        content: |
+          ### bgp_summary_post
+          ### Host: {{ inventory_hostname }}
+          ### Timestamp: {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+
+          {{ bgp_summary_post.stdout | default('') }}
+        mode: "0640"
+      delegate_to: localhost
+      listen: "Wait for BGP to reconverge then re-collect summary"
+
+    - name: "Update ServiceNow with post-remediation summary"
+      servicenow.itsm.incident:
+        instance: "{{ snow_instance }}"
+        username: "{{ snow_username }}"
+        password: "{{ snow_password }}"
+        number: "{{ incident_number }}"
+        work_notes: |
+          Remediation executed: clear BGP neighbor(s) {{ bgp_neighbors_to_reset | default([]) }}
+          Post-remediation BGP summary captured:
+          - {{ artifact_dir }}/bgp_summary_post.txt
+
+          Please confirm all neighbors are Established and validate route impact/prefixes.
+      when: snow_update_enabled | bool
+      delegate_to: localhost
+      listen: "Wait for BGP to reconverge then re-collect summary"
