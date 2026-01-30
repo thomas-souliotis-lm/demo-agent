@@ -1,0 +1,284 @@
+---
+- name: Investigate and (optionally) remediate BGP peers down on MRD switch 10.120.4.34
+  hosts: mrd_switch
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    # Target device (use inventory host_vars preferred; this is a sensible default)
+    mrd_switch_ip: "10.120.4.34"
+
+    # Network OS selection. Set this in inventory/group_vars to match your platform:
+    # - "arista.eos.eos" (Arista EOS)
+    # - "cisco.ios.ios" (Cisco IOS/IOS-XE)
+    # - "cisco.nxos.nxos" (Cisco NX-OS)
+    # - "junipernetworks.junos.junos" (Juniper Junos)
+    network_os: "arista.eos.eos"
+
+    # Optional: provide a subset of neighbors to focus on. Empty = all neighbors returned by device.
+    bgp_neighbor_filter: []
+
+    # Remediation controls (kept safe by default)
+    remediation_enabled: false
+    remediation_method: "bounce_neighbors"  # options: "bounce_neighbors", "restart_bgp_process"
+    remediation_confirm_minimum_down_neighbors: 1  # only remediate if at least this many peers are down
+
+    # Time to wait before re-check after remediation
+    post_remediation_wait_seconds: 15
+
+    # CLI commands per platform for investigation and remediation.
+    # Notes:
+    # - Remediation commands are intentionally minimal and should be validated for your NOS and policies.
+    # - Prefer "bounce_neighbors" over "restart_bgp_process" to reduce blast radius.
+    platform_commands:
+      arista.eos.eos:
+        show_bgp_summary: "show ip bgp summary"
+        show_bgp_neighbors: "show ip bgp neighbors"
+        show_interfaces_brief: "show interfaces status"
+        show_ip_int_brief: "show ip interface brief"
+        show_route_summary: "show ip route summary"
+        # Bouncing neighbors requires knowing neighbor IPs; we generate these dynamically from parsed state when possible.
+        restart_bgp_process:
+          - "configure terminal"
+          # EOS supports 'service routing protocols model ribd' variations; restarting BGP is not always desired.
+          # Use with caution—left as a placeholder for your environment's standard procedure.
+          - "end"
+      cisco.ios.ios:
+        show_bgp_summary: "show ip bgp summary"
+        show_bgp_neighbors: "show ip bgp neighbors"
+        show_interfaces_brief: "show interfaces status"
+        show_ip_int_brief: "show ip interface brief"
+        show_route_summary: "show ip route summary"
+        restart_bgp_process:
+          - "clear ip bgp * soft"  # safer than process restart; adjust if you have an approved process restart
+      cisco.nxos.nxos:
+        show_bgp_summary: "show ip bgp summary"
+        show_bgp_neighbors: "show ip bgp neighbors"
+        show_interfaces_brief: "show interface status"
+        show_ip_int_brief: "show ip interface brief"
+        show_route_summary: "show ip route summary"
+        restart_bgp_process:
+          - "clear ip bgp * soft"
+      junipernetworks.junos.junos:
+        show_bgp_summary: "show bgp summary"
+        show_bgp_neighbors: "show bgp neighbor"
+        show_interfaces_brief: "show interfaces terse"
+        show_ip_int_brief: "show interfaces terse"
+        show_route_summary: "show route summary"
+        restart_bgp_process:
+          - "restart routing"  # high impact; keep disabled unless explicitly enabled/approved
+
+  pre_tasks:
+    - name: Ensure required connection variables are set (network_cli/httpapi)
+      ansible.builtin.assert:
+        that:
+          - ansible_connection is defined
+          - ansible_connection in ["network_cli", "httpapi"]
+        fail_msg: >
+          Set ansible_connection to 'network_cli' (SSH CLI) or 'httpapi' (if supported),
+          and set ansible_network_os accordingly (e.g., arista.eos.eos, cisco.ios.ios, cisco.nxos.nxos, junipernetworks.junos.junos).
+      tags: [always]
+
+    - name: Ensure network OS is provided/valid
+      ansible.builtin.assert:
+        that:
+          - network_os in platform_commands.keys()
+        fail_msg: "Unsupported network_os '{{ network_os }}'. Supported: {{ platform_commands.keys() | list }}"
+      tags: [always]
+
+    - name: Set ansible_network_os from network_os if not already set
+      ansible.builtin.set_fact:
+        ansible_network_os: "{{ ansible_network_os | default(network_os) }}"
+      tags: [always]
+
+  tasks:
+    - name: Collect platform facts (best-effort)
+      block:
+        - name: Gather network facts
+          ansible.netcommon.network_facts:
+          register: net_facts
+      rescue:
+        - name: Continue even if network facts collection fails (capture reason)
+          ansible.builtin.set_fact:
+            net_facts_error: "{{ ansible_failed_result | to_nice_json }}"
+      tags: [investigate, facts]
+
+    - name: Run investigation show commands
+      ansible.netcommon.cli_command:
+        command: "{{ item }}"
+      loop:
+        - "{{ platform_commands[network_os].show_interfaces_brief }}"
+        - "{{ platform_commands[network_os].show_ip_int_brief }}"
+        - "{{ platform_commands[network_os].show_route_summary }}"
+        - "{{ platform_commands[network_os].show_bgp_summary }}"
+        - "{{ platform_commands[network_os].show_bgp_neighbors }}"
+      register: show_outputs
+      tags: [investigate, show]
+
+    - name: Extract key outputs into named facts
+      ansible.builtin.set_fact:
+        out_interfaces_brief: "{{ show_outputs.results[0].stdout | default('') }}"
+        out_ip_int_brief: "{{ show_outputs.results[1].stdout | default('') }}"
+        out_route_summary: "{{ show_outputs.results[2].stdout | default('') }}"
+        out_bgp_summary: "{{ show_outputs.results[3].stdout | default('') }}"
+        out_bgp_neighbors: "{{ show_outputs.results[4].stdout | default('') }}"
+      tags: [investigate, show]
+
+    # Note: Parsing BGP summary differs per NOS. We do a lightweight heuristic to count "down-ish" signals.
+    # For production, replace with TextFSM/ntc-templates parsing for your platform.
+    - name: Heuristically detect potential down BGP neighbors from summary output
+      ansible.builtin.set_fact:
+        bgp_down_indicators:
+          - "Idle"
+          - "Active"
+          - "Connect"
+          - "OpenSent"
+          - "OpenConfirm"
+          - "Down"
+          - "NoNeg"
+        bgp_down_count: >-
+          {{
+            (bgp_down_indicators
+              | map('regex_findall', out_bgp_summary)
+              | map('length')
+              | list
+              | sum)
+          }}
+      tags: [investigate, bgp]
+
+    - name: Print investigation summary (BGP/Interfaces/Routes)
+      ansible.builtin.debug:
+        msg:
+          - "Device: {{ inventory_hostname }} (expected IP {{ mrd_switch_ip }})"
+          - "Facts error (if any): {{ net_facts_error | default('none') }}"
+          - "Heuristic BGP down indicator count: {{ bgp_down_count }}"
+          - "---- show bgp summary ----"
+          - "{{ out_bgp_summary }}"
+          - "---- show ip interface brief / interfaces terse ----"
+          - "{{ out_ip_int_brief }}"
+      tags: [investigate, report]
+
+    - name: Decide whether remediation is allowed
+      ansible.builtin.set_fact:
+        remediation_allowed: >-
+          {{
+            remediation_enabled | bool
+            and (bgp_down_count | int) >= (remediation_confirm_minimum_down_neighbors | int)
+          }}
+      tags: [remediate, decision]
+
+    - name: Stop if remediation disabled or not enough evidence (guardrail)
+      ansible.builtin.debug:
+        msg: >-
+          Remediation is NOT running. remediation_enabled={{ remediation_enabled }},
+          bgp_down_count={{ bgp_down_count }}, threshold={{ remediation_confirm_minimum_down_neighbors }}.
+      when: not remediation_allowed
+      tags: [remediate, decision]
+
+    - name: Remediate - bounce BGP sessions (safe option; implementation depends on neighbor list availability)
+      block:
+        - name: Attempt to derive neighbor IPs from summary output (best-effort regex)
+          ansible.builtin.set_fact:
+            derived_neighbor_ips: >-
+              {{
+                (out_bgp_summary | regex_findall('(?:\\b\\d{1,3}\\.){3}\\d{1,3}\\b'))
+                | unique
+              }}
+          tags: [remediate, bounce]
+
+        - name: Apply neighbor filter if provided
+          ansible.builtin.set_fact:
+            neighbor_ips_to_bounce: >-
+              {{
+                (bgp_neighbor_filter | length > 0)
+                  | ternary(derived_neighbor_ips | intersect(bgp_neighbor_filter), derived_neighbor_ips)
+              }}
+          tags: [remediate, bounce]
+
+        - name: Guardrail - require at least one neighbor IP to bounce
+          ansible.builtin.assert:
+            that:
+              - neighbor_ips_to_bounce | length > 0
+            fail_msg: >
+              Could not derive any neighbor IPs from BGP summary output and no bgp_neighbor_filter provided.
+              Provide bgp_neighbor_filter (list of neighbor IPs) to proceed safely.
+          tags: [remediate, bounce]
+
+        # Vendor-specific bounce commands:
+        # - EOS/NXOS/IOS: clear ip bgp <neighbor> soft (or hard). We'll do soft to reduce impact.
+        # - Junos: clear bgp neighbor <ip> (routing-options). Kept generic; adjust as needed.
+        - name: Build per-neighbor bounce commands for this platform
+          ansible.builtin.set_fact:
+            bounce_commands: >-
+              {%- set cmds = [] -%}
+              {%- for ip in neighbor_ips_to_bounce -%}
+              {%-   if network_os in ['cisco.ios.ios','cisco.nxos.nxos','arista.eos.eos'] -%}
+              {%-     set _ = cmds.append('clear ip bgp ' ~ ip ~ ' soft') -%}
+              {%-   elif network_os == 'junipernetworks.junos.junos' -%}
+              {%-     set _ = cmds.append('clear bgp neighbor ' ~ ip) -%}
+              {%-   endif -%}
+              {%- endfor -%}
+              {{ cmds }}
+          tags: [remediate, bounce]
+
+        - name: Execute BGP neighbor bounce commands
+          ansible.netcommon.cli_command:
+            command: "{{ item }}"
+          loop: "{{ bounce_commands }}"
+          register: bounce_result
+          changed_when: true  # operational action
+          tags: [remediate, bounce]
+
+        - name: Wait for BGP to reconverge after bounce
+          ansible.builtin.pause:
+            seconds: "{{ post_remediation_wait_seconds }}"
+          tags: [remediate, bounce]
+
+      when:
+        - remediation_allowed
+        - remediation_method == "bounce_neighbors"
+      tags: [remediate, bounce]
+
+    - name: Remediate - restart/refresh BGP process (higher impact; platform dependent)
+      block:
+        - name: Execute platform restart/refresh commands
+          ansible.netcommon.cli_command:
+            command: "{{ item }}"
+          loop: "{{ platform_commands[network_os].restart_bgp_process }}"
+          register: bgp_restart_result
+          changed_when: true  # operational action
+          tags: [remediate, restart]
+
+        - name: Wait for BGP to reconverge after restart/refresh
+          ansible.builtin.pause:
+            seconds: "{{ post_remediation_wait_seconds }}"
+          tags: [remediate, restart]
+      when:
+        - remediation_allowed
+        - remediation_method == "restart_bgp_process"
+      tags: [remediate, restart]
+
+    - name: Validate - re-check BGP summary after remediation (or investigation only)
+      ansible.netcommon.cli_command:
+        command: "{{ platform_commands[network_os].show_bgp_summary }}"
+      register: bgp_summary_after
+      tags: [validate, bgp]
+
+    - name: Report - show BGP summary after
+      ansible.builtin.debug:
+        msg:
+          - "---- show bgp summary (after) ----"
+          - "{{ bgp_summary_after.stdout | default('') }}"
+      tags: [validate, report]
+
+    - name: Fail if BGP still appears down (heuristic) when remediation was attempted
+      ansible.builtin.fail:
+        msg: >
+          BGP peers still appear down based on heuristic parsing after remediation.
+          Review outputs and escalate (check reachability, ACLs, interface state, CPU, logs, upstream).
+      when:
+        - remediation_allowed
+        - (bgp_down_indicators | map('regex_search', bgp_summary_after.stdout | default('')) | select('truthy') | list | length) > 0
+      tags: [validate, bgp]
+
+  handlers: []
