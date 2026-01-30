@@ -1,0 +1,212 @@
+---
+- name: "MRD switch 10.120.4.34#2 - Triage and (optional) remediate BGP peers down"
+  hosts: mrd_switch_10_120_4_34_2
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    # ========= Connection defaults (override in inventory/group_vars/host_vars) =========
+    # Recommended inventory vars for network_cli:
+    # ansible_network_os: <eos|ios|nxos|junos>
+    # ansible_connection: network_cli
+    # ansible_user: ...
+    # ansible_password: ...
+    # ansible_become: true
+    # ansible_become_method: enable
+
+    # ========= Triage / report output =========
+    triage_output_dir: "./triage_outputs"
+    triage_run_id: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+    triage_report_file: "{{ triage_output_dir }}/mrd_10.120.4.34_2_bgp_triage_{{ triage_run_id }}.json"
+
+    # ========= Remediation safety gates (default: no disruption) =========
+    remediation_enabled: false              # Master kill-switch for disruptive changes
+    allow_clear_bgp: false                  # Allow clearing BGP neighbors
+    allow_bounce_interfaces: false           # Allow bouncing interfaces
+    remediation_confirm_token: ""            # Must equal 'I_UNDERSTAND_THIS_WILL_DISRUPT_TRAFFIC' to run disruptive actions
+
+    # ========= Target selection (fill in to scope changes) =========
+    # If empty, remediation tasks will be skipped (even if enabled) unless you explicitly set targets.
+    bgp_neighbors_to_clear: []              # e.g. ["10.0.0.1", "10.0.0.2"]
+    interfaces_to_bounce: []                # e.g. ["Ethernet1", "Ethernet2/1"]
+
+    # ========= OS-specific command sets =========
+    # The playbook uses generic "cli_command"; override these if your platform differs.
+    commands_common:
+      - "show clock"
+      - "show version"
+      - "show inventory"
+      - "show logging last 200"
+    commands_health:
+      - "show processes cpu"
+      - "show processes memory"
+      - "show interfaces counters errors"
+      - "show interfaces status"
+      - "show ip interface brief"
+      - "show arp"
+      - "show ip route summary"
+    commands_bgp:
+      - "show ip bgp summary"
+      - "show bgp summary"
+      - "show ip bgp neighbors"
+      - "show bgp neighbors"
+
+    # Attempt to detect config deltas depending on platform support
+    commands_config_deltas:
+      - "show configuration commit list"
+      - "show configuration | compare rollback 1"
+      - "show archive log config all"
+      - "show running-config | section router bgp"
+
+    # Reachability tests executed from the control node (not from the switch)
+    ping_count: 3
+    ping_timeout_sec: 2
+
+  pre_tasks:
+    - name: "Validate disruptive remediation confirmation token (hard safety gate)"
+      ansible.builtin.assert:
+        that:
+          - remediation_enabled | bool implies (remediation_confirm_token == "I_UNDERSTAND_THIS_WILL_DISRUPT_TRAFFIC")
+        fail_msg: >-
+          Remediation is enabled but confirmation token is missing/incorrect.
+          Set remediation_confirm_token=I_UNDERSTAND_THIS_WILL_DISRUPT_TRAFFIC to proceed.
+      tags: [always, safety]
+
+    - name: "Ensure local triage output directory exists"
+      ansible.builtin.file:
+        path: "{{ triage_output_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      run_once: true
+      tags: [triage, report]
+
+  tasks:
+    - name: "Triage | Collect common platform information (non-fatal per command)"
+      ansible.netcommon.cli_command:
+        command: "{{ item }}"
+      register: common_cmds
+      failed_when: false  # Some commands may not exist on all NOS; collect what we can.
+      loop: "{{ commands_common }}"
+      tags: [triage]
+
+    - name: "Triage | Collect health signals (CPU/mem/interface errors)"
+      ansible.netcommon.cli_command:
+        command: "{{ item }}"
+      register: health_cmds
+      failed_when: false
+      loop: "{{ commands_health }}"
+      tags: [triage]
+
+    - name: "Triage | Collect BGP state (summary + neighbors)"
+      ansible.netcommon.cli_command:
+        command: "{{ item }}"
+      register: bgp_cmds
+      failed_when: false
+      loop: "{{ commands_bgp }}"
+      tags: [triage, bgp]
+
+    - name: "Triage | Collect recent config deltas / change hints (best-effort)"
+      ansible.netcommon.cli_command:
+        command: "{{ item }}"
+      register: cfg_cmds
+      failed_when: false
+      loop: "{{ commands_config_deltas }}"
+      tags: [triage, config]
+
+    # --- Optional reachability checks from the control node (useful when device can't ping) ---
+    - name: "Triage | Ping each BGP neighbor target from control node (if provided)"
+      ansible.builtin.command: "ping -c {{ ping_count }} -W {{ ping_timeout_sec }} {{ item }}"
+      register: neighbor_pings
+      failed_when: false
+      changed_when: false
+      loop: "{{ bgp_neighbors_to_clear }}"
+      delegate_to: localhost
+      tags: [triage, reachability]
+      when: bgp_neighbors_to_clear | length > 0
+
+    - name: "Report | Build structured triage report JSON"
+      ansible.builtin.copy:
+        dest: "{{ triage_report_file }}"
+        mode: "0640"
+        content: |
+          {
+            "run_id": "{{ triage_run_id }}",
+            "target": "MRD switch 10.120.4.34#2",
+            "host": "{{ inventory_hostname }}",
+            "timestamp_utc": "{{ triage_run_id }}",
+            "common_commands": {{ common_cmds.results | default([]) | to_json }},
+            "health_commands": {{ health_cmds.results | default([]) | to_json }},
+            "bgp_commands": {{ bgp_cmds.results | default([]) | to_json }},
+            "config_delta_commands": {{ cfg_cmds.results | default([]) | to_json }},
+            "neighbor_ping_results": {{ neighbor_pings.results | default([]) | to_json }}
+          }
+      delegate_to: localhost
+      tags: [report, triage]
+
+    # ===========================
+    # Remediation (gated & scoped)
+    # ===========================
+    - name: "Remediation | Clear specific BGP neighbors (safe, scoped)"
+      ansible.netcommon.cli_command:
+        command: "clear ip bgp {{ item }} soft"
+      loop: "{{ bgp_neighbors_to_clear }}"
+      when:
+        - remediation_enabled | bool
+        - allow_clear_bgp | bool
+        - bgp_neighbors_to_clear | length > 0
+      notify: "Post-remediation | Re-collect BGP summary"
+      tags: [remediate, bgp]
+      # Note: Using "soft" by default to reduce disruption. Override command if your runbook requires hard clear.
+
+    - name: "Remediation | Bounce specified interfaces (shutdown/no shutdown) - use with caution"
+      ansible.netcommon.cli_command:
+        command: |
+          configure terminal
+          interface {{ item }}
+          shutdown
+          no shutdown
+          end
+      loop: "{{ interfaces_to_bounce }}"
+      when:
+        - remediation_enabled | bool
+        - allow_bounce_interfaces | bool
+        - interfaces_to_bounce | length > 0
+      notify: "Post-remediation | Re-collect interface error counters"
+      tags: [remediate, interfaces]
+      # NOTE: This is intentionally explicit and scoped to interfaces_to_bounce to avoid accidental outages.
+
+  handlers:
+    - name: "Post-remediation | Re-collect BGP summary"
+      ansible.netcommon.cli_command:
+        command: "show ip bgp summary"
+      register: post_bgp_summary
+      failed_when: false
+      listen: "Post-remediation | Re-collect BGP summary"
+      tags: [bgp, remediate]
+
+    - name: "Post-remediation | Re-collect interface error counters"
+      ansible.netcommon.cli_command:
+        command: "show interfaces counters errors"
+      register: post_int_errors
+      failed_when: false
+      listen: "Post-remediation | Re-collect interface error counters"
+      tags: [interfaces, remediate]
+
+    - name: "Post-remediation | Append post-checks to report"
+      ansible.builtin.lineinfile:
+        path: "{{ triage_report_file }}"
+        insertafter: EOF
+        line: |
+          ,
+          "post_remediation": {
+            "bgp_summary": {{ post_bgp_summary | default({}) | to_json }},
+            "interface_errors": {{ post_int_errors | default({}) | to_json }}
+          }
+      delegate_to: localhost
+      failed_when: false
+      listen:
+        - "Post-remediation | Re-collect BGP summary"
+        - "Post-remediation | Re-collect interface error counters"
+      tags: [report, remediate]
+      # Comment: This appends a JSON fragment. If you need strict JSON, convert the report task to use a template end-to-end.
