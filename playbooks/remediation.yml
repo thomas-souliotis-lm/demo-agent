@@ -1,0 +1,347 @@
+---
+- name: Investigate and (optionally) remediate BGP peers down on MRD switch 10.120.4.34
+  hosts: mrd_switch
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    # Collection directory on the Ansible controller
+    artifact_root: "./artifacts"
+    artifact_dir: "{{ artifact_root }}/{{ inventory_hostname }}_bgp_triage_{{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
+
+    # Set to true to allow any remediation actions (safe by default = false)
+    remediation_enabled: false
+
+    # Optional: restrict remediation and targeted checks to specific neighbors
+    # Examples: ["10.10.10.1", "10.10.10.2"]
+    bgp_neighbors: []
+
+    # Optional: interface bounce (only used when remediation_enabled=true)
+    # Examples: ["Ethernet1/1", "Port-Channel10"]
+    bounce_interfaces: []
+
+    # Optional: clear BGP sessions (only used when remediation_enabled=true)
+    # If bgp_neighbors is empty and this is true, the play will clear ALL BGP sessions (guarded).
+    clear_bgp_enabled: false
+
+    # Extra guard: must be set true to allow clearing ALL BGP sessions when bgp_neighbors is empty
+    allow_clear_all_bgp: false
+
+    # Platform hints (best-effort). Set this to your NOS if you know it.
+    # Supported in this playbook: "ios", "nxos", "eos"
+    # If unknown, set to "auto" and the play will try generic show commands.
+    network_os_family: "auto"
+
+    # Commands to run for investigation. These are mostly common across IOS/NX-OS/EOS.
+    # You can add/remove commands as needed for your environment.
+    investigate_commands_common:
+      - "show clock"
+      - "show version"
+      - "show hostname"
+      - "show running-config | section router bgp"
+      - "show ip bgp summary"
+      - "show bgp summary"
+      - "show ip interface brief"
+      - "show interface status"
+      - "show interfaces"
+      - "show ip route summary"
+      - "show ip route"
+      - "show arp"
+      - "show logging | last 200"
+
+    # Neighbor-focused commands (run when bgp_neighbors provided)
+    neighbor_detail_commands_ios_nxos:
+      - "show ip bgp neighbors {{ item }}"
+      - "show ip route {{ item }}"
+      - "ping {{ item }} repeat 5"
+      - "traceroute {{ item }}"
+    neighbor_detail_commands_eos:
+      - "show bgp neighbor {{ item }}"
+      - "show ip route {{ item }}"
+      - "ping {{ item }} repeat 5"
+      - "traceroute {{ item }}"
+
+  pre_tasks:
+    - name: Validate inventory is pointing to the correct device (10.120.4.34)
+      ansible.builtin.assert:
+        that:
+          - ansible_host is defined
+          - ansible_host == "10.120.4.34"
+        fail_msg: >-
+          This playbook is intended for MRD switch 10.120.4.34. Ensure the inventory host has ansible_host=10.120.4.34.
+      tags: [always, safety]
+
+    - name: Create local artifact directory on controller
+      ansible.builtin.file:
+        path: "{{ artifact_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      run_once: false
+      tags: [always, artifacts]
+
+  tasks:
+    - name: Detect network OS if set to auto (best-effort)
+      when: network_os_family == "auto"
+      block:
+        - name: Try show version for OS hints
+          ansible.netcommon.cli_command:
+            command: "show version"
+          register: show_version_out
+          tags: [investigate, os_detect]
+
+        - name: Set network_os_family from show version output (heuristic)
+          ansible.builtin.set_fact:
+            network_os_family: >-
+              {% set v = (show_version_out.stdout | default('') | lower) %}
+              {% if 'nx-os' in v or 'nexus' in v %}nxos
+              {% elif 'cisco ios' in v or 'ios xe' in v or 'ios-xe' in v %}ios
+              {% elif 'arista' in v or 'eos' in v %}eos
+              {% else %}generic{% endif %}
+          tags: [investigate, os_detect]
+      rescue:
+        - name: Fall back to generic OS family if detection fails
+          ansible.builtin.set_fact:
+            network_os_family: "generic"
+          tags: [investigate, os_detect]
+
+    - name: Record detected/selected OS family
+      ansible.builtin.copy:
+        content: "network_os_family={{ network_os_family }}\n"
+        dest: "{{ artifact_dir }}/os_family.txt"
+        mode: "0640"
+      delegate_to: localhost
+      tags: [investigate, artifacts]
+
+    - name: Collect BGP/Interface/Route/Log investigation outputs
+      block:
+        - name: Run common investigation show commands
+          ansible.netcommon.cli_command:
+            command: "{{ item }}"
+          loop: "{{ investigate_commands_common }}"
+          register: investigate_out
+          failed_when: false  # Keep gathering even if some commands are unsupported on this NOS
+          tags: [investigate, collect]
+
+        - name: Save common investigation outputs to artifact file
+          ansible.builtin.copy:
+            content: |
+              # Host: {{ inventory_hostname }} ({{ ansible_host }})
+              # Timestamp: {{ lookup('pipe','date -Is') }}
+              # OS family: {{ network_os_family }}
+
+              {% for r in investigate_out.results %}
+              ## COMMAND: {{ r.item }}
+              {{ (r.stdout | default('')) }}
+
+              {% if (r.stderr | default(''))|length > 0 %}
+              ## STDERR:
+              {{ r.stderr }}
+              {% endif %}
+              {% endfor %}
+            dest: "{{ artifact_dir }}/investigation_common.txt"
+            mode: "0640"
+          delegate_to: localhost
+          tags: [investigate, artifacts]
+      rescue:
+        - name: Fail clearly if CLI collection cannot proceed
+          ansible.builtin.fail:
+            msg: "Failed to collect investigation data via CLI. Check network_cli connectivity and credentials."
+          tags: [investigate, collect]
+
+    - name: Collect neighbor-specific diagnostics (if bgp_neighbors provided)
+      when: bgp_neighbors | length > 0
+      block:
+        - name: Run neighbor diagnostics (IOS/NX-OS/generic)
+          ansible.netcommon.cli_command:
+            command: "{{ item_cmd }}"
+          loop: "{{ bgp_neighbors }}"
+          loop_control:
+            loop_var: nbr
+          vars:
+            cmds: >-
+              {% if network_os_family == 'eos' %}
+              {{ neighbor_detail_commands_eos }}
+              {% else %}
+              {{ neighbor_detail_commands_ios_nxos }}
+              {% endif %}
+          # Execute per-neighbor list of commands
+          register: neighbor_diag
+          failed_when: false
+          changed_when: false
+          tags: [investigate, neighbors]
+          # Use a nested loop pattern via include_tasks-like behavior in-line:
+          # We render commands per neighbor below using with_items style.
+      rescue:
+        - name: Note neighbor diagnostics failure but continue
+          ansible.builtin.debug:
+            msg: "Neighbor diagnostics encountered an error; continuing with remaining steps."
+          tags: [investigate, neighbors]
+
+    # Because Ansible does not directly support nested loops in a single task cleanly,
+    # we implement neighbor command execution in a separate block using a loop of command strings.
+    - name: Run neighbor diagnostics commands and save outputs (expanded)
+      when: bgp_neighbors | length > 0
+      block:
+        - name: Build per-neighbor command list
+          ansible.builtin.set_fact:
+            neighbor_cmds_expanded: >-
+              {%- set out = [] -%}
+              {%- if network_os_family == 'eos' -%}
+              {%- set base = neighbor_detail_commands_eos -%}
+              {%- else -%}
+              {%- set base = neighbor_detail_commands_ios_nxos -%}
+              {%- endif -%}
+              {%- for n in bgp_neighbors -%}
+              {%- for c in base -%}
+              {%- set _ = out.append(c.replace('{{ item }}', n)) -%}
+              {%- endfor -%}
+              {%- endfor -%}
+              {{ out }}
+          tags: [investigate, neighbors]
+
+        - name: Execute expanded neighbor diagnostics commands
+          ansible.netcommon.cli_command:
+            command: "{{ item }}"
+          loop: "{{ neighbor_cmds_expanded }}"
+          register: neighbor_cmds_out
+          failed_when: false
+          changed_when: false
+          tags: [investigate, neighbors]
+
+        - name: Save neighbor diagnostics outputs
+          ansible.builtin.copy:
+            content: |
+              # Neighbor diagnostics
+              # Host: {{ inventory_hostname }} ({{ ansible_host }})
+              # Timestamp: {{ lookup('pipe','date -Is') }}
+              # Neighbors: {{ bgp_neighbors | join(', ') }}
+
+              {% for r in neighbor_cmds_out.results %}
+              ## COMMAND: {{ r.item }}
+              {{ (r.stdout | default('')) }}
+
+              {% if (r.stderr | default(''))|length > 0 %}
+              ## STDERR:
+              {{ r.stderr }}
+              {% endif %}
+              {% endfor %}
+            dest: "{{ artifact_dir }}/neighbor_diagnostics.txt"
+            mode: "0640"
+          delegate_to: localhost
+          tags: [investigate, artifacts]
+
+    - name: Remediation guardrails summary
+      ansible.builtin.debug:
+        msg:
+          - "remediation_enabled={{ remediation_enabled }}"
+          - "bounce_interfaces={{ bounce_interfaces }}"
+          - "clear_bgp_enabled={{ clear_bgp_enabled }}"
+          - "bgp_neighbors={{ bgp_neighbors }}"
+          - "allow_clear_all_bgp={{ allow_clear_all_bgp }}"
+      tags: [remediate, safety]
+
+    - name: Bounce specified interfaces (optional remediation)
+      when:
+        - remediation_enabled | bool
+        - bounce_interfaces | length > 0
+      block:
+        - name: Shut/no shut interfaces (IOS-like syntax)
+          when: network_os_family in ['ios', 'nxos', 'generic', 'eos']
+          ansible.netcommon.cli_config:
+            config:
+              - "interface {{ item }}"
+              - "shutdown"
+            # Note: We'll no shutdown in a second task to keep it explicit and auditable
+          loop: "{{ bounce_interfaces }}"
+          tags: [remediate, interfaces]
+
+        - name: No shutdown interfaces
+          when: network_os_family in ['ios', 'nxos', 'generic', 'eos']
+          ansible.netcommon.cli_config:
+            config:
+              - "interface {{ item }}"
+              - "no shutdown"
+          loop: "{{ bounce_interfaces }}"
+          notify: Re-check BGP summary
+          tags: [remediate, interfaces]
+      rescue:
+        - name: Fail remediation if interface bounce fails
+          ansible.builtin.fail:
+            msg: "Interface bounce remediation failed. Check interface names and privilege level."
+          tags: [remediate, interfaces]
+
+    - name: Clear BGP sessions (optional remediation)
+      when:
+        - remediation_enabled | bool
+        - clear_bgp_enabled | bool
+      block:
+        - name: Safety check before clearing ALL BGP sessions
+          ansible.builtin.assert:
+            that:
+              - bgp_neighbors | length > 0 or allow_clear_all_bgp | bool
+            fail_msg: >-
+              Refusing to clear ALL BGP sessions because bgp_neighbors is empty.
+              To allow, set allow_clear_all_bgp=true (use with extreme caution).
+          tags: [remediate, safety]
+
+        - name: Clear BGP for specific neighbors (preferred)
+          when: bgp_neighbors | length > 0
+          ansible.netcommon.cli_command:
+            command: >-
+              {% if network_os_family == 'eos' %}
+              clear bgp {{ item }}
+              {% else %}
+              clear ip bgp {{ item }}
+              {% endif %}
+          loop: "{{ bgp_neighbors }}"
+          register: clear_bgp_out
+          failed_when: false
+          changed_when: true
+          notify: Re-check BGP summary
+          tags: [remediate, bgp]
+
+        - name: Clear ALL BGP sessions (guarded)
+          when:
+            - bgp_neighbors | length == 0
+            - allow_clear_all_bgp | bool
+          ansible.netcommon.cli_command:
+            command: >-
+              {% if network_os_family == 'eos' %}
+              clear bgp *
+              {% else %}
+              clear ip bgp *
+              {% endif %}
+          register: clear_bgp_all_out
+          failed_when: false
+          changed_when: true
+          notify: Re-check BGP summary
+          tags: [remediate, bgp]
+
+      rescue:
+        - name: Fail remediation if BGP clear fails
+          ansible.builtin.fail:
+            msg: "Clear BGP remediation failed. Check command support and privilege level."
+          tags: [remediate, bgp]
+
+  handlers:
+    - name: Re-check BGP summary
+      ansible.netcommon.cli_command:
+        command: "show ip bgp summary"
+      register: bgp_summary_after
+      failed_when: false
+      changed_when: false
+      listen: Re-check BGP summary
+
+    - name: Save post-remediation BGP summary
+      ansible.builtin.copy:
+        content: |
+          # Post-remediation BGP summary
+          # Host: {{ inventory_hostname }} ({{ ansible_host }})
+          # Timestamp: {{ lookup('pipe','date -Is') }}
+
+          {{ (bgp_summary_after.stdout | default('')) }}
+        dest: "{{ artifact_dir }}/post_remediation_bgp_summary.txt"
+        mode: "0640"
+      delegate_to: localhost
+      listen: Re-check BGP summary
