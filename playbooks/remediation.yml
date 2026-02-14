@@ -1,0 +1,381 @@
+---
+- name: Investigate and remediate BGP peers down on MRD switch 10.120.4.34#2
+  hosts: mrd_switch_2
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    # Target switch reference (for documentation/reporting)
+    target_mgmt_ip: "10.120.4.34"
+
+    # Platform selection (affects commands). Supported: eos, nxos, iosxr, ios
+    # Override in inventory/group_vars/host_vars as needed.
+    network_os: "{{ ansible_network_os | default('eos') }}"
+
+    # Neighbor validation: either provide explicit neighbors, or leave empty to auto-discover.
+    bgp_expected_neighbors: []   # e.g. ["10.0.0.1", "10.0.0.2"]
+    # If true, will try to discover neighbors from "show bgp summary" output.
+    bgp_autodiscover_neighbors: true
+
+    # What "good" looks like: minimum number of Established peers.
+    # Set to 1 if you just want at least one established, or to exact expected count.
+    bgp_min_established: 1
+
+    # Remediation toggles
+    enable_remediation: true
+    remediation_strategy: "soft"   # soft | hard
+    # soft: clear bgp neighbor * soft (or equivalent)
+    # hard: restart bgp process (or equivalent)
+
+    # Safety controls
+    # If true, the play will stop after diagnostics and will not change anything.
+    diagnostics_only: false
+
+    # Reporting directory on the Ansible control node
+    report_root: "./reports"
+    report_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    report_dir: "{{ report_root }}/bgp_down_{{ inventory_hostname }}_{{ report_timestamp }}"
+
+    # Command sets per platform (basic and commonly supported)
+    platform_cmds:
+      eos:
+        bgp_summary: "show ip bgp summary"
+        bgp_neighbors: "show ip bgp neighbors"
+        interfaces: "show interfaces status"
+        routes: "show ip route"
+        logs: "show logging last 200"
+        arp: "show ip arp"
+        ping_prefix: "ping"
+        clear_bgp_soft: "clear ip bgp * soft"
+        clear_bgp_hard: "clear ip bgp *"
+        restart_bgp: "restart bgp"
+      nxos:
+        bgp_summary: "show bgp ipv4 unicast summary"
+        bgp_neighbors: "show bgp ipv4 unicast neighbors"
+        interfaces: "show interface status"
+        routes: "show ip route"
+        logs: "show logging last 200"
+        arp: "show ip arp"
+        ping_prefix: "ping"
+        clear_bgp_soft: "clear bgp ipv4 unicast * soft"
+        clear_bgp_hard: "clear bgp ipv4 unicast *"
+        restart_bgp: "restart bgp"
+      iosxr:
+        bgp_summary: "show bgp summary"
+        bgp_neighbors: "show bgp neighbors"
+        interfaces: "show interfaces brief"
+        routes: "show route"
+        logs: "show logging last 200"
+        arp: "show arp"
+        ping_prefix: "ping"
+        clear_bgp_soft: "clear bgp ipv4 unicast * soft in"
+        clear_bgp_hard: "clear bgp ipv4 unicast *"
+        restart_bgp: "process restart bgp"
+      ios:
+        bgp_summary: "show ip bgp summary"
+        bgp_neighbors: "show ip bgp neighbors"
+        interfaces: "show interfaces status"
+        routes: "show ip route"
+        logs: "show logging | last 200"
+        arp: "show ip arp"
+        ping_prefix: "ping"
+        clear_bgp_soft: "clear ip bgp * soft"
+        clear_bgp_hard: "clear ip bgp *"
+        restart_bgp: ""  # IOS often requires more intrusive steps; leave empty to avoid unsafe action.
+
+    # Resolved command mapping
+    cmd_bgp_summary: "{{ platform_cmds[network_os].bgp_summary }}"
+    cmd_bgp_neighbors: "{{ platform_cmds[network_os].bgp_neighbors }}"
+    cmd_interfaces: "{{ platform_cmds[network_os].interfaces }}"
+    cmd_routes: "{{ platform_cmds[network_os].routes }}"
+    cmd_logs: "{{ platform_cmds[network_os].logs }}"
+    cmd_arp: "{{ platform_cmds[network_os].arp }}"
+    cmd_ping_prefix: "{{ platform_cmds[network_os].ping_prefix }}"
+    cmd_clear_bgp_soft: "{{ platform_cmds[network_os].clear_bgp_soft }}"
+    cmd_clear_bgp_hard: "{{ platform_cmds[network_os].clear_bgp_hard }}"
+    cmd_restart_bgp: "{{ platform_cmds[network_os].restart_bgp }}"
+
+  pre_tasks:
+    - name: Validate platform selection and required variables
+      ansible.builtin.assert:
+        that:
+          - platform_cmds is defined
+          - network_os in platform_cmds
+          - cmd_bgp_summary | length > 0
+        fail_msg: >
+          Unsupported or missing network_os '{{ network_os }}'.
+          Set ansible_network_os in inventory/host_vars to one of: {{ platform_cmds.keys() | list }}.
+      tags: [always]
+
+    - name: Create local report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      run_once: false
+      tags: [always]
+
+  tasks:
+    - name: Collect baseline BGP summary
+      ansible.netcommon.cli_command:
+        command: "{{ cmd_bgp_summary }}"
+      register: bgp_summary_before
+      changed_when: false
+      tags: [diagnostics, bgp]
+
+    - name: Collect baseline BGP neighbors detail
+      ansible.netcommon.cli_command:
+        command: "{{ cmd_bgp_neighbors }}"
+      register: bgp_neighbors_before
+      changed_when: false
+      tags: [diagnostics, bgp]
+
+    - name: Collect baseline interface status
+      ansible.netcommon.cli_command:
+        command: "{{ cmd_interfaces }}"
+      register: interfaces_before
+      changed_when: false
+      tags: [diagnostics, interfaces]
+
+    - name: Collect baseline routing table snippet
+      ansible.netcommon.cli_command:
+        command: "{{ cmd_routes }}"
+      register: routes_before
+      changed_when: false
+      tags: [diagnostics, routing]
+
+    - name: Collect baseline ARP table
+      ansible.netcommon.cli_command:
+        command: "{{ cmd_arp }}"
+      register: arp_before
+      changed_when: false
+      tags: [diagnostics, l2]
+
+    - name: Collect baseline logs (last 200 lines)
+      ansible.netcommon.cli_command:
+        command: "{{ cmd_logs }}"
+      register: logs_before
+      changed_when: false
+      tags: [diagnostics, logs]
+
+    - name: Save baseline diagnostics to local files
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/baseline_{{ item.name }}.txt"
+        content: |
+          ## {{ item.name }}
+          ## Host: {{ inventory_hostname }} ({{ target_mgmt_ip }})
+          ## Timestamp: {{ report_timestamp }}
+
+          {{ item.data }}
+        mode: "0640"
+      loop:
+        - { name: "bgp_summary", data: "{{ bgp_summary_before.stdout | default('') }}" }
+        - { name: "bgp_neighbors", data: "{{ bgp_neighbors_before.stdout | default('') }}" }
+        - { name: "interfaces", data: "{{ interfaces_before.stdout | default('') }}" }
+        - { name: "routes", data: "{{ routes_before.stdout | default('') }}" }
+        - { name: "arp", data: "{{ arp_before.stdout | default('') }}" }
+        - { name: "logs", data: "{{ logs_before.stdout | default('') }}" }
+      delegate_to: localhost
+      changed_when: false
+      tags: [diagnostics, report]
+
+    # --- Parsing/Validation ---
+    - name: Determine established peer count from BGP summary output (best-effort parsing)
+      # This is intentionally heuristic because formats vary across vendors.
+      # We treat lines containing "Estab" (or "Established") as established peers.
+      ansible.builtin.set_fact:
+        bgp_established_count_before: >-
+          {{
+            (bgp_summary_before.stdout | default('') | regex_findall('(?im)^.*\\b(Estab|Established)\\b.*$') | length)
+          }}
+      changed_when: false
+      tags: [validate, bgp]
+
+    - name: Auto-discover neighbor IPs from BGP summary if requested and none provided (best-effort)
+      ansible.builtin.set_fact:
+        bgp_discovered_neighbors: >-
+          {{
+            (bgp_summary_before.stdout | default('') | regex_findall('(?im)^(\\d{1,3}(?:\\.\\d{1,3}){3})\\s+') )
+          }}
+      when:
+        - bgp_autodiscover_neighbors | bool
+        - (bgp_expected_neighbors | length) == 0
+      changed_when: false
+      tags: [validate, bgp]
+
+    - name: Set effective neighbor list
+      ansible.builtin.set_fact:
+        bgp_neighbor_list: "{{ (bgp_expected_neighbors | length > 0) | ternary(bgp_expected_neighbors, (bgp_discovered_neighbors | default([]))) }}"
+      changed_when: false
+      tags: [validate, bgp]
+
+    - name: Mark whether BGP appears down based on established count threshold
+      ansible.builtin.set_fact:
+        bgp_is_down: "{{ (bgp_established_count_before | int) < (bgp_min_established | int) }}"
+      changed_when: false
+      tags: [validate, bgp]
+
+    - name: Write validation summary to report
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/validation_summary.txt"
+        content: |
+          Host: {{ inventory_hostname }} ({{ target_mgmt_ip }})
+          Platform: {{ network_os }}
+          Timestamp: {{ report_timestamp }}
+
+          Established peers (heuristic): {{ bgp_established_count_before }}
+          Minimum required: {{ bgp_min_established }}
+          BGP considered down: {{ bgp_is_down }}
+
+          Neighbor list (expected/discovered): {{ bgp_neighbor_list | to_nice_yaml(indent=2) }}
+      delegate_to: localhost
+      changed_when: false
+      tags: [report, validate]
+
+    - name: Stop after diagnostics if diagnostics_only is enabled
+      ansible.builtin.meta: end_play
+      when: diagnostics_only | bool
+      tags: [diagnostics]
+
+    # --- Connectivity checks to neighbors (if we have a list) ---
+    - name: Ping discovered/expected BGP neighbors (if any)
+      ansible.netcommon.cli_command:
+        # Many NOS require different ping syntax; we use a simple default.
+        # If your platform needs VRF/source, override with platform-specific vars.
+        command: "{{ cmd_ping_prefix }} {{ item }}"
+      loop: "{{ bgp_neighbor_list }}"
+      register: ping_results
+      changed_when: false
+      failed_when: false
+      when:
+        - bgp_neighbor_list is defined
+        - bgp_neighbor_list | length > 0
+      tags: [diagnostics, connectivity]
+
+    - name: Save ping results to report
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/ping_results.txt"
+        content: |
+          Host: {{ inventory_hostname }} ({{ target_mgmt_ip }})
+          Timestamp: {{ report_timestamp }}
+
+          {% if ping_results is not defined %}
+          No ping results (no neighbors discovered/provided).
+          {% else %}
+          {% for r in ping_results.results %}
+          ### Neighbor: {{ r.item }}
+          rc: {{ r.rc | default('n/a') }}
+          stdout:
+          {{ r.stdout | default('') }}
+
+          stderr:
+          {{ r.stderr | default('') }}
+
+          {% endfor %}
+          {% endif %}
+      delegate_to: localhost
+      changed_when: false
+      tags: [report, connectivity]
+
+    # --- Remediation (safe, gated) ---
+    - name: Decide remediation command based on strategy
+      ansible.builtin.set_fact:
+        bgp_remediation_command: >-
+          {{
+            (remediation_strategy == 'hard')
+            | ternary(cmd_restart_bgp, cmd_clear_bgp_soft)
+          }}
+      changed_when: false
+      tags: [remediation, bgp]
+
+    - name: Assert remediation is possible for selected strategy (avoid unsafe/unsupported actions)
+      ansible.builtin.assert:
+        that:
+          - bgp_remediation_command is defined
+          - bgp_remediation_command | length > 0
+        fail_msg: >
+          Remediation strategy '{{ remediation_strategy }}' selected but no command is defined for platform '{{ network_os }}'.
+          Consider setting remediation_strategy=soft or override cmd_restart_bgp/cmd_clear_bgp_soft.
+      when:
+        - enable_remediation | bool
+        - bgp_is_down | bool
+      tags: [remediation, bgp]
+
+    - name: Apply remediation action (clear/restart BGP) when BGP is down
+      ansible.netcommon.cli_command:
+        command: "{{ bgp_remediation_command }}"
+      register: remediation_result
+      when:
+        - enable_remediation | bool
+        - bgp_is_down | bool
+      notify: Recheck BGP state
+      tags: [remediation, bgp]
+
+  handlers:
+    - name: Recheck BGP state
+      # Handler runs only if remediation task executed.
+      block:
+        - name: Wait briefly for BGP to converge
+          ansible.builtin.pause:
+            seconds: 20
+
+        - name: Collect BGP summary after remediation
+          ansible.netcommon.cli_command:
+            command: "{{ cmd_bgp_summary }}"
+          register: bgp_summary_after
+          changed_when: false
+
+        - name: Determine established peer count after remediation (heuristic parsing)
+          ansible.builtin.set_fact:
+            bgp_established_count_after: >-
+              {{
+                (bgp_summary_after.stdout | default('') | regex_findall('(?im)^.*\\b(Estab|Established)\\b.*$') | length)
+              }}
+          changed_when: false
+
+        - name: Save post-remediation BGP summary to report
+          ansible.builtin.copy:
+            dest: "{{ report_dir }}/post_remediation_bgp_summary.txt"
+            content: |
+              Host: {{ inventory_hostname }} ({{ target_mgmt_ip }})
+              Platform: {{ network_os }}
+              Timestamp: {{ report_timestamp }}
+
+              Remediation command run:
+              {{ bgp_remediation_command }}
+
+              Established peers before: {{ bgp_established_count_before | default('n/a') }}
+              Established peers after:  {{ bgp_established_count_after | default('n/a') }}
+
+              Output:
+              {{ bgp_summary_after.stdout | default('') }}
+          delegate_to: localhost
+          changed_when: false
+
+        - name: Fail if BGP still appears down after remediation
+          ansible.builtin.fail:
+            msg: >
+              BGP peers still appear down after remediation on {{ inventory_hostname }}.
+              Established before={{ bgp_established_count_before }}, after={{ bgp_established_count_after }}.
+              See reports in {{ report_dir }}.
+          when: (bgp_established_count_after | int) < (bgp_min_established | int)
+      rescue:
+        - name: Save remediation error context
+          ansible.builtin.copy:
+            dest: "{{ report_dir }}/remediation_error.txt"
+            content: |
+              Host: {{ inventory_hostname }}
+              Timestamp: {{ report_timestamp }}
+
+              Remediation attempted:
+              {{ bgp_remediation_command | default('n/a') }}
+
+              Remediation result:
+              {{ remediation_result | default({}) | to_nice_yaml(indent=2) }}
+          delegate_to: localhost
+          changed_when: false
+
+        - name: Stop play due to remediation failure
+          ansible.builtin.fail:
+            msg: "Remediation encountered an error. See {{ report_dir }}/remediation_error.txt"
